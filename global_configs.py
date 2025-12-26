@@ -19,6 +19,8 @@ def set_dataset_config(dataset_name,):
     dataset_configs = {
         "mosi": {"ACOUSTIC_DIM": 74, "VISUAL_DIM": 47, "TEXT_DIM": 768},
         "mosei": {"ACOUSTIC_DIM": 74, "VISUAL_DIM": 35, "TEXT_DIM": 768},
+        # simsv2 text_bert already stores fixed-length features of size 50, not raw token ids
+        "simsv2": {"ACOUSTIC_DIM": 25, "VISUAL_DIM": 177, "TEXT_DIM": 768},
     }
 
     config = dataset_configs.get(dataset_name)

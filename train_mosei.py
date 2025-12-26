@@ -21,6 +21,7 @@ from KANMCP import KANMCP
 
 import global_configs
 from global_configs import DEVICE
+import experiment_utils as exp_utils
 
 import warnings
 from min_norm_solvers import MinNormSolver
@@ -52,10 +53,9 @@ parser.add_argument('--gamma', type=float, default=1.5)
 parser.add_argument('--tqdm_disable', type=bool, default=False)
 parser.add_argument('--use_MMPareto', type=bool, default=True)
 
-parser.add_argument('--use_DRDMIB_or_AE', type=int, default=2)#0：DRD-MIB 1：AE 2：FC 3: Transformer
+parser.add_argument('--use_DRDMIB_or_AE', type=int, default=3)
 parser.add_argument('--use_KAN_or_MLP', type=bool, default=True)
-
-
+parser.add_argument('--run_base_dir', type=str, default="/root/autodl-tmp/runs")
 args = parser.parse_args()
 
 global_configs.set_dataset_config(args.dataset)
@@ -324,9 +324,6 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             record_names_text.append((name, param))
             continue
 
-    def grad_or_zeros(param):
-        return param.grad if param.grad is not None else torch.zeros_like(param)
-
     for step, batch in enumerate(tqdm(train_dataloader, desc="Iteration", disable=args.tqdm_disable)):
         batch = tuple(t.to(DEVICE) for t in batch)
         input_ids, visual, acoustic, label_ids = batch
@@ -367,24 +364,22 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
                     for tensor_name, param in record_names_visual:
                         if loss_type not in grads_visual.keys():
                             grads_visual[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_visual[loss_type][tensor_name] = g.data.clone()
+                        # if param.grad is not None:
+                        grads_visual[loss_type][tensor_name] = param.grad.data.clone()
                     grads_visual[loss_type]["concat"] = torch.cat(
                         [grads_visual[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_visual])
                 elif loss_type == 'audio':
                     for tensor_name, param in record_names_audio:
                         if loss_type not in grads_audio.keys():
                             grads_audio[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_audio[loss_type][tensor_name] = g.data.clone()
+                        grads_audio[loss_type][tensor_name] = param.grad.data.clone()
                     grads_audio[loss_type]["concat"] = torch.cat(
                         [grads_audio[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_audio])
                 elif loss_type == 'text':
                     for tensor_name, param in record_names_text:
                         if loss_type not in grads_text.keys():
                             grads_text[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_text[loss_type][tensor_name] = g.data.clone()
+                        grads_text[loss_type][tensor_name] = param.grad.data.clone()
                     grads_text[loss_type]["concat"] = torch.cat(
                         [grads_text[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_text])
 
@@ -392,24 +387,21 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
                     for tensor_name, param in record_names_text:
                         if loss_type not in grads_text.keys():
                             grads_text[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_text[loss_type][tensor_name] = g.data.clone()
+                        grads_text[loss_type][tensor_name] = param.grad.data.clone()
                     grads_text[loss_type]["concat"] = torch.cat(
                         [grads_text[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_text])
 
                     for tensor_name, param in record_names_audio:
                         if loss_type not in grads_audio.keys():
                             grads_audio[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_audio[loss_type][tensor_name] = g.data.clone()
+                        grads_audio[loss_type][tensor_name] = param.grad.data.clone()
                     grads_audio[loss_type]["concat"] = torch.cat(
                         [grads_audio[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_audio])
 
                     for tensor_name, param in record_names_visual:
                         if loss_type not in grads_visual.keys():
                             grads_visual[loss_type] = {}
-                        g = grad_or_zeros(param)
-                        grads_visual[loss_type][tensor_name] = g.data.clone()
+                        grads_visual[loss_type][tensor_name] = param.grad.data.clone()
                     grads_visual[loss_type]["concat"] = torch.cat(
                         [grads_visual[loss_type][tensor_name].flatten() for tensor_name, _ in record_names_visual])
 
@@ -526,7 +518,12 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             scheduler.step()
             optimizer.zero_grad()
 
-    return tr_loss / nb_tr_steps
+    return {
+        "total": tr_loss / nb_tr_steps,
+        "audio": tr_audio_loss / nb_tr_steps,
+        "visual": tr_visual_loss / nb_tr_steps,
+        "text": tr_text_loss / nb_tr_steps,
+    }
 
 
 def eval_epoch(model: nn.Module, dev_dataloader: DataLoader):
@@ -654,7 +651,7 @@ def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=Fal
     f_score = f1_score(y_test, preds, average="weighted")
     acc2 = accuracy_score(y_test, preds)
 
-    return acc7, acc2, f_score, mae, corr
+    return acc7, acc2, f_score, mae, corr, preds, y_test
 
 
 def train(
@@ -664,6 +661,8 @@ def train(
         test_data_loader,
         optimizer,
         scheduler,
+        run_meta=None,
+        swan_run=None,
 ):
     min_eval_loss = 1000
     test_result = {
@@ -672,16 +671,64 @@ def train(
         "f1": 0,
         "mae": 0,
         "corr": 0,
+        "epoch": 0,
     }
+    metrics_history = []
+    best_model_path = None
 
     for epoch_i in range(int(args.n_epochs)):
-        train_loss = train_epoch(model, train_dataloader, optimizer, scheduler)
+        train_losses = train_epoch(model, train_dataloader, optimizer, scheduler)
         eval_loss = eval_epoch(model, validation_dataloader)
-        acc7, acc2, f_score, mae, corr = test_score_model(model, test_data_loader)
+        acc7, acc2, f_score, mae, corr, preds, labels = test_score_model(model, test_data_loader)
 
-        # 输出
-        print("TRAIN: epoch:{}, train_loss:{}, eval_loss:{}".format(epoch_i + 1, train_loss, eval_loss))
+        print("TRAIN: epoch:{}, train_loss:{}, eval_loss:{}".format(epoch_i + 1, train_losses["total"], eval_loss))
         print("TEST: acc7: {}, acc2: {}, f1: {}, mae: {}, corr: {}".format(acc7, acc2, f_score, mae, corr))
+
+        epoch_metrics = {
+            "epoch": epoch_i + 1,
+            "train_loss": float(train_losses["total"]),
+            "eval_loss": float(eval_loss),
+            "train_loss_audio": float(train_losses["audio"]),
+            "train_loss_visual": float(train_losses["visual"]),
+            "train_loss_text": float(train_losses["text"]),
+            "acc7": float(acc7),
+            "acc2": float(acc2),
+            "f1": float(f_score),
+            "mae": float(mae),
+            "corr": float(corr),
+        }
+        metrics_history.append(epoch_metrics)
+        if run_meta:
+            metrics_dir = os.path.join(run_meta["artifacts"], "metrics")
+            os.makedirs(metrics_dir, exist_ok=True)
+            exp_utils.save_json(epoch_metrics, os.path.join(metrics_dir, f"test_epoch_{epoch_i + 1}.json"))
+        exp_utils.log_swanlab_metrics(
+            swan_run,
+            {
+                "loss/train": epoch_metrics["train_loss"],
+                "loss/train_audio": epoch_metrics["train_loss_audio"],
+                "loss/train_visual": epoch_metrics["train_loss_visual"],
+                "loss/train_text": epoch_metrics["train_loss_text"],
+                "loss/eval": epoch_metrics["eval_loss"],
+                "metrics/acc7": epoch_metrics["acc7"],
+                "metrics/acc2": epoch_metrics["acc2"],
+                "metrics/f1": epoch_metrics["f1"],
+                "metrics/mae": epoch_metrics["mae"],
+                "metrics/corr": epoch_metrics["corr"],
+                "outputs/mean": float(np.mean(preds)),
+                "outputs/std": float(np.std(preds)),
+                "outputs/min": float(np.min(preds)),
+                "outputs/max": float(np.max(preds)),
+            },
+            step=epoch_i + 1,
+        )
+
+        if run_meta:
+            outputs_dir = os.path.join(run_meta["artifacts"], "outputs")
+            exp_utils.save_npz(
+                {"preds": preds, "labels": labels},
+                os.path.join(outputs_dir, f"epoch_{epoch_i + 1}.npz"),
+            )
 
         if eval_loss < min_eval_loss:
             min_eval_loss = eval_loss
@@ -690,12 +737,17 @@ def train(
             test_result["f1"] = f_score
             test_result["mae"] = mae
             test_result["corr"] = corr
+            test_result["epoch"] = epoch_i + 1
+            if run_meta:
+                best_model_path = os.path.join(run_meta["artifacts"], "best_model.pt")
+                exp_utils.save_model_checkpoint(model, best_model_path)
+                exp_utils.save_json(test_result, os.path.join(run_meta["run_dir"], "best_result.json"))
 
         if epoch_i + 1 == args.n_epochs:
             print("====RESULT====")
             print("acc7:{}, acc2:{}, f1:{}, mae:{}, corr:{}".format(test_result["acc7"], test_result["acc2"],test_result["f1"], test_result["mae"],test_result["corr"]))
 
-    return test_result
+    return test_result, metrics_history, best_model_path
 
 
 def main():
@@ -703,6 +755,10 @@ def main():
     print(args)
 
     set_random_seed(args.seed)
+
+    run_meta = exp_utils.create_run_dirs(args.dataset, base_dir=args.run_base_dir)
+    exp_utils.save_json(vars(args), os.path.join(run_meta["run_dir"], "args.json"))
+    swan_run = exp_utils.init_swanlab_run(args, run_meta)
 
     (
         train_data_loader,
@@ -714,19 +770,59 @@ def main():
     model, optimizer, scheduler = prep_for_training(
         num_train_optimization_steps)
     print(model)
-
-    train(
+    test_result, metrics_history, best_model_path = train(
        model,
        train_data_loader,
        dev_data_loader,
        test_data_loader,
        optimizer,
        scheduler,
+       run_meta=run_meta,
+       swan_run=swan_run,
     )
+
+    exp_utils.save_json(metrics_history, os.path.join(run_meta["run_dir"], "metrics_history.json"))
+    last_model_path = os.path.join(run_meta["artifacts"], "last_model.pt")
+    exp_utils.save_model_checkpoint(model, last_model_path)
+
+    if args.use_KAN_or_MLP:
+        kan_batch = next(iter(test_data_loader))
+        contribution = exp_utils.plot_kan_contribution(
+            model,
+            kan_batch,
+            args.compressed_dim,
+            DEVICE,
+            os.path.join(run_meta["plots"], "kan_contribution.png"),
+        )
+        exp_utils.save_json(contribution, os.path.join(run_meta["run_dir"], "kan_contribution.json"))
+        exp_utils.log_swanlab_metrics(
+            swan_run,
+            {f"kan/{k}": v for k, v in contribution["per_modality"].items()},
+            step=int(args.n_epochs) + 1,
+        )
+        exp_utils.plot_kan_tree(
+            model,
+            kan_batch,
+            DEVICE,
+            os.path.join(run_meta["plots"], "kan_tree.png"),
+        )
+        exp_utils.plot_kan_model_diagram(
+            model,
+            kan_batch,
+            DEVICE,
+            os.path.join(run_meta["plots"], "kan_model.png"),
+        )
+
+    if swan_run is not None and exp_utils.swanlab is not None:
+        exp_utils.log_swanlab_metrics(
+            swan_run,
+            {f"best/{k}": float(v) for k, v in test_result.items() if k != "epoch"},
+            step=int(args.n_epochs) + 1,
+        )
+        exp_utils.swanlab.finish()
 
     return model
 
 
 if __name__ == '__main__':
     main()
-

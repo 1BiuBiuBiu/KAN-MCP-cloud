@@ -17,11 +17,11 @@ class LinearEncoder(nn.Module):
             nn.Linear(hidden_dim, latent_dim)
         )
 
-        self.fc = nn.Linear(latent_dim, 1)
+        self.decoder = nn.Linear(latent_dim, 1)
 
     def forward(self, x, label_ids):
         encoder = self.encoder(x)
-        out = self.fc(encoder)
+        out = self.decoder(encoder)
         loss = self.loss_fct(out, label_ids)
         return encoder, out, loss
 

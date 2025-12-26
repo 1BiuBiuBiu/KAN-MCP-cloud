@@ -35,34 +35,20 @@ class Transformer(nn.Module):
             use_cls_token,
         )
         self.to_latent = nn.Linear(embed_dim, latent_dim)
+        self.decoder = nn.Linear(latent_dim, 1)
 
-        # Decode without adding an extra cls token to keep the length aligned with the input.
-        self.decoder_input = nn.Linear(latent_dim, embed_dim)
-        self.decoder = TransformerEncoder(
-            embed_dim,
-            num_heads,
-            layers,
-            attn_dropout,
-            relu_dropout,
-            res_dropout,
-            embed_dropout,
-            attn_mask,
-            use_cls_token=False,
-        )
-
-    def forward(self, x):
+    def forward(self, x, label_ids):
         # x: (seq_len, batch, embed_dim)
         enc_tokens = self.encoder(x)
         latent_tokens = self.to_latent(enc_tokens)
-
         tokens_for_decode = latent_tokens[1:] if self.use_cls_token else latent_tokens
-        dec_tokens = self.decoder(self.decoder_input(tokens_for_decode))
-        # Keep reconstruction loss on the same order as the 2D MIB loss by
-        # avoiding an extra average over the sequence dimension. We average
-        # per-token feature errors, sum across time, then average across the batch.
-        recon_error = F.mse_loss(dec_tokens, x, reduction='none').mean(dim=2)
-        loss = recon_error.mean(dim=0).mean()
-        return latent_tokens, dec_tokens, loss
+        decoded_logits = self.decoder(tokens_for_decode)
+        # Average over time to keep the MSE on a similar scale as the
+        # LinearEncoder despite varying sequence lengths (e.g., 2D vs 3D inputs).
+        out = decoded_logits.mean(dim=0)
+        target = label_ids.view(out.size(0), -1)
+        loss = self.loss_fct(out, target)
+        return latent_tokens, out, loss
 
 
 
@@ -285,5 +271,6 @@ if __name__ == '__main__':
 
     transformer = Transformer(300, 4, 2, 3, use_cls_token=True)
     y = torch.rand(20, 2, 300)
-    lat, dec, loss = transformer(y)
+    dummy_label = torch.rand(2, 1)
+    lat, dec, loss = transformer(y, dummy_label)
     print(lat.shape, dec.shape, loss)

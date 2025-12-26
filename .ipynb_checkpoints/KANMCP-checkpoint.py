@@ -175,10 +175,7 @@ class KANMCP(DebertaV2PreTrainedModel):
             input_ids,
             visual,
             acoustic,
-            label_ids,
-            text_label_ids=None,
-            audio_label_ids=None,
-            visual_label_ids=None
+            label_ids
     ):
         # deberta processing text data
         if self.dataset != "simsv2":
@@ -187,17 +184,13 @@ class KANMCP(DebertaV2PreTrainedModel):
         else:
             # simsv2 already stores text features; skip DeBERTa and use them directly
             x_embedding = input_ids.float()
-        # Each encoder receives its own supervision; default to global labels when per-modality labels are absent.
-        text_targets = text_label_ids if text_label_ids is not None else label_ids
-        audio_targets = audio_label_ids if audio_label_ids is not None else label_ids
-        visual_targets = visual_label_ids if visual_label_ids is not None else label_ids
 
         # feature extraction
         if  self.use_DRDMIB_or_AE == 3:
             # Transformers expect (seq, batch, dim); grab cls token (latent) as the feature.
-            text_lat, out_t, loss_t = self.TEncoder(x_embedding.transpose(0, 1), text_targets)
-            audio_lat, out_a, loss_a = self.AEncoder(acoustic.transpose(0, 1), audio_targets)
-            visual_lat, out_v, loss_v = self.VEncoder(visual.transpose(0, 1), visual_targets)
+            text_lat, out_t, loss_t = self.TEncoder(x_embedding.transpose(0, 1), label_ids)
+            audio_lat, out_a, loss_a = self.AEncoder(acoustic.transpose(0, 1), label_ids)
+            visual_lat, out_v, loss_v = self.VEncoder(visual.transpose(0, 1), label_ids)
 
             text_feature = text_lat[0]
             audio_feature = audio_lat[0]
@@ -213,17 +206,17 @@ class KANMCP(DebertaV2PreTrainedModel):
 
         # feature reduction
         if self.use_DRDMIB_or_AE == 0:
-            text_feature, out_t, loss_t = self.TEncoder(x, text_targets)
-            audio_feature, out_a, loss_a = self.AEncoder(a, audio_targets)
-            visual_feature, out_v, loss_v = self.VEncoder(v, visual_targets)
+            text_feature, out_t, loss_t = self.TEncoder(x, label_ids)
+            audio_feature, out_a, loss_a = self.AEncoder(a, label_ids)
+            visual_feature, out_v, loss_v = self.VEncoder(v, label_ids)
         elif self.use_DRDMIB_or_AE == 1:
             text_feature, out_t, loss_t = self.TEncoder(x)
             audio_feature, out_a, loss_a = self.AEncoder(a)
             visual_feature, out_v, loss_v = self.VEncoder(v)
         elif self.use_DRDMIB_or_AE == 2:
-            text_feature, out_t, loss_t = self.TEncoder(x, text_targets)
-            audio_feature, out_a, loss_a = self.AEncoder(a, audio_targets)
-            visual_feature, out_v, loss_v = self.VEncoder(v, visual_targets)
+            text_feature, out_t, loss_t = self.TEncoder(x, label_ids)
+            audio_feature, out_a, loss_a = self.AEncoder(a, label_ids)
+            visual_feature, out_v, loss_v = self.VEncoder(v, label_ids)
         # concat
         concat_feature = torch.cat([text_feature, audio_feature, visual_feature], dim=1)
 
