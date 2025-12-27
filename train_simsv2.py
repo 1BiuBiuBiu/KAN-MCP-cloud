@@ -411,6 +411,9 @@ def train_epoch(model: nn.Module, train_dataloader: DataLoader, optimizer, sched
             visual_norm,
             acoustic_norm,
             label_ids,
+            text_label_ids,
+            audio_label_ids,
+            visual_label_ids,
         )
 
         logits = outputs["logits"]
@@ -715,28 +718,84 @@ def multiclass_acc(preds, truths):
     return np.sum(np.round(preds) == np.round(truths)) / float(len(truths))
 
 
-def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero=False):
+def test_score_model(model: nn.Module, test_dataloader: DataLoader, use_zero: bool = False):
     preds, y_test = test_epoch(model, test_dataloader)
-    non_zeros = np.array(
-        [i for i, e in enumerate(y_test) if e != 0 or use_zero])
 
-    test_preds_a7 = np.clip(preds, a_min=-3., a_max=3.)
-    test_truth_a7 = np.clip(y_test, a_min=-3., a_max=3.)
-    acc7 = multiclass_acc(test_preds_a7, test_truth_a7)
+    allowed_vals = np.array([-1.0, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0], dtype=np.float32)
 
-    mae = np.mean(np.absolute(preds - y_test))
-    corr = np.corrcoef(preds, y_test)[0][1]
+    def _nearest_allowed(values: np.ndarray) -> np.ndarray:
+        """Snap continuous predictions to the nearest allowed label."""
+        diff = np.abs(values[:, None] - allowed_vals[None, :])
+        nearest_idx = np.argmin(diff, axis=1)
+        return allowed_vals[nearest_idx]
 
-    preds = preds[non_zeros]
-    y_test = y_test[non_zeros]
+    def _map_to_5_class(values: np.ndarray) -> np.ndarray:
+        buckets = {
+            -1.0: 0,
+            -0.8: 0,
+            -0.6: 1,
+            -0.4: 1,
+            -0.2: 1,
+            0.0: 2,
+            0.2: 3,
+            0.4: 3,
+            0.6: 3,
+            0.8: 4,
+            1.0: 4,
+        }
 
-    preds = preds >= 0
-    y_test = y_test >= 0
+        def _bucket(v: float) -> int:
+            # guard floating drift by rounding to one decimal and falling back to nearest allowed value
+            v_rounded = float(np.round(v, 1))
+            if v_rounded in buckets:
+                return buckets[v_rounded]
+            # fallback: snap to nearest allowed then bucket
+            nearest = float(_nearest_allowed(np.asarray([v], dtype=np.float32))[0])
+            return buckets[nearest]
 
-    f_score = f1_score(y_test, preds, average="weighted")
-    acc2 = accuracy_score(y_test, preds)
+        return np.array([_bucket(float(v)) for v in values], dtype=np.int64)
 
-    return acc7, acc2, f_score, mae, corr, preds, y_test
+    def _map_to_3_class(values: np.ndarray) -> np.ndarray:
+        return np.array([
+            0 if v < 0 else 1 if v == 0 else 2
+            for v in values
+        ], dtype=np.int64)
+
+    def _map_to_2_class(values: np.ndarray) -> np.ndarray:
+        return np.array([0 if v < 0 else 1 for v in values], dtype=np.int64)
+
+    snapped_preds = _nearest_allowed(np.asarray(preds, dtype=np.float32))
+    snapped_labels = _nearest_allowed(np.asarray(y_test, dtype=np.float32))
+
+    non_zeros = np.array([i for i, e in enumerate(snapped_labels) if e != 0 or use_zero])
+
+    mae = np.mean(np.absolute(snapped_preds - snapped_labels))
+    corr = np.corrcoef(snapped_preds, snapped_labels)[0][1]
+
+    # 5-class metrics
+    preds_5 = _map_to_5_class(snapped_preds)
+    labels_5 = _map_to_5_class(snapped_labels)
+    acc5 = accuracy_score(labels_5, preds_5)
+
+    # 3-class metrics
+    preds_3 = _map_to_3_class(snapped_preds)
+    labels_3 = _map_to_3_class(snapped_labels)
+    acc3 = accuracy_score(labels_3, preds_3)
+
+    # 2-class metrics (negative vs non-negative). Neutral joins non-negative.
+    preds_2 = _map_to_2_class(snapped_preds[non_zeros])
+    labels_2 = _map_to_2_class(snapped_labels[non_zeros])
+    acc2 = accuracy_score(labels_2, preds_2)
+    f1_2 = f1_score(labels_2, preds_2, average="weighted")
+
+    return {
+        "acc5": acc5,
+        "acc3": acc3,
+        "acc2": acc2,
+        "f1": f1_2,
+        "mae": float(mae),
+        "corr": float(corr),
+    }
 
 
 def train(
@@ -751,11 +810,12 @@ def train(
 ):
     min_eval_loss = 1000
     test_result = {
-        "acc2": 0,
-        "acc7": 0,
-        "f1": 0,
-        "mae": 0,
-        "corr": 0,
+        "acc5": 0.0,
+        "acc3": 0.0,
+        "acc2": 0.0,
+        "f1": 0.0,
+        "mae": 0.0,
+        "corr": 0.0,
         "epoch": 0,
     }
     metrics_history = []
@@ -764,11 +824,15 @@ def train(
     for epoch_i in range(int(args.n_epochs)):
         train_losses = train_epoch(model, train_dataloader, optimizer, scheduler)
         eval_loss = eval_epoch(model, validation_dataloader)
-        acc7, acc2, f_score, mae, corr, preds, labels = test_score_model(model, test_data_loader)
+        metrics = test_score_model(model, test_data_loader)
 
         # 输出
         print("TRAIN: epoch:{}, train_loss:{}, eval_loss:{}".format(epoch_i + 1, train_losses["total"], eval_loss))
-        print("TEST: acc7: {}, acc2: {}, f1: {}, mae: {}, corr: {}".format(acc7, acc2, f_score, mae, corr))
+        print(
+            "TEST: acc5: {}, acc3: {}, acc2: {}, f1: {}, mae: {}, corr: {}".format(
+                metrics["acc5"], metrics["acc3"], metrics["acc2"], metrics["f1"], metrics["mae"], metrics["corr"]
+            )
+        )
 
         epoch_metrics = {
             "epoch": epoch_i + 1,
@@ -777,11 +841,12 @@ def train(
             "train_loss_audio": float(train_losses["audio"]),
             "train_loss_visual": float(train_losses["visual"]),
             "train_loss_text": float(train_losses["text"]),
-            "acc7": float(acc7),
-            "acc2": float(acc2),
-            "f1": float(f_score),
-            "mae": float(mae),
-            "corr": float(corr),
+            "acc5": float(metrics["acc5"]),
+            "acc3": float(metrics["acc3"]),
+            "acc2": float(metrics["acc2"]),
+            "f1": float(metrics["f1"]),
+            "mae": float(metrics["mae"]),
+            "corr": float(metrics["corr"]),
         }
         metrics_history.append(epoch_metrics)
         if run_meta:
@@ -796,33 +861,24 @@ def train(
                 "loss/train_visual": epoch_metrics["train_loss_visual"],
                 "loss/train_text": epoch_metrics["train_loss_text"],
                 "loss/eval": epoch_metrics["eval_loss"],
-                "metrics/acc7": epoch_metrics["acc7"],
+                "metrics/acc5": epoch_metrics["acc5"],
+                "metrics/acc3": epoch_metrics["acc3"],
                 "metrics/acc2": epoch_metrics["acc2"],
                 "metrics/f1": epoch_metrics["f1"],
                 "metrics/mae": epoch_metrics["mae"],
                 "metrics/corr": epoch_metrics["corr"],
-                "outputs/mean": float(np.mean(preds)),
-                "outputs/std": float(np.std(preds)),
-                "outputs/min": float(np.min(preds)),
-                "outputs/max": float(np.max(preds)),
             },
             step=epoch_i + 1,
         )
 
-        if run_meta:
-            outputs_dir = os.path.join(run_meta["artifacts"], "outputs")
-            exp_utils.save_npz(
-                {"preds": preds, "labels": labels},
-                os.path.join(outputs_dir, f"epoch_{epoch_i + 1}.npz"),
-            )
-
         if eval_loss < min_eval_loss:
             min_eval_loss = eval_loss
-            test_result["acc2"] = acc2
-            test_result["acc7"] = acc7
-            test_result["f1"] = f_score
-            test_result["mae"] = mae
-            test_result["corr"] = corr
+            test_result["acc5"] = metrics["acc5"]
+            test_result["acc3"] = metrics["acc3"]
+            test_result["acc2"] = metrics["acc2"]
+            test_result["f1"] = metrics["f1"]
+            test_result["mae"] = metrics["mae"]
+            test_result["corr"] = metrics["corr"]
             test_result["epoch"] = epoch_i + 1
             if run_meta:
                 best_model_path = os.path.join(run_meta["artifacts"], "best_model.pt")
@@ -831,7 +887,16 @@ def train(
 
         if epoch_i + 1 == args.n_epochs:
             print("====RESULT====")
-            print("acc7:{}, acc2:{}, f1:{}, mae:{}, corr:{}".format(test_result["acc7"], test_result["acc2"],test_result["f1"], test_result["mae"],test_result["corr"]))
+            print(
+                "acc5:{}, acc3:{}, acc2:{}, f1:{}, mae:{}, corr:{}".format(
+                    test_result["acc5"],
+                    test_result["acc3"],
+                    test_result["acc2"],
+                    test_result["f1"],
+                    test_result["mae"],
+                    test_result["corr"],
+                )
+            )
 
     return test_result, metrics_history, best_model_path
 
