@@ -15,7 +15,7 @@ from tqdm import tqdm
 
 from torch.nn import MSELoss
 
-from transformers import get_linear_schedule_with_warmup, DebertaV2Tokenizer
+from transformers import get_linear_schedule_with_warmup, DebertaV2Tokenizer, BertTokenizer, AutoTokenizer
 from torch.optim import AdamW
 from KANMCP import KANMCP
 
@@ -31,7 +31,7 @@ import re
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", type=str, default="google-bert")
 parser.add_argument("--dataset", type=str, choices=["mosi", "mosei", "simsv2"], default="simsv2")
-parser.add_argument("--max_seq_length", type=int, default=768)
+parser.add_argument("--max_seq_length", type=int, default=50)
 parser.add_argument("--train_batch_size", type=int, default=32)
 parser.add_argument("--dev_batch_size", type=int, default=128)
 parser.add_argument("--test_batch_size", type=int, default=128)
@@ -51,7 +51,7 @@ parser.add_argument('--weight2', type=float, default=1)
 
 parser.add_argument('--gamma', type=float, default=1.5)
 parser.add_argument('--tqdm_disable', type=bool, default=False)
-parser.add_argument('--use_MMPareto', type=bool, default=False)
+parser.add_argument('--use_MMPareto', type=bool, default=True)
 
 parser.add_argument('--use_DRDMIB_or_AE', type=int, default=0)
 parser.add_argument('--use_KAN_or_MLP', type=bool, default=True)
@@ -185,68 +185,39 @@ def get_appropriate_dataset(data):
         text_labels = data.get("text_labels", labels)
         vision_labels = data.get("vision_labels", labels)
         audio_labels = data.get("audio_labels", labels)
+        
+        # Use raw text instead of pre-processed text_bert
         text_bert = data["text"]
+        raw_text = data["raw_text"]
         audio = data["audio"]
         vision = data["vision"]
-        audio_lens = data["audio_lengths"]
-        vision_lens = data["vision_lengths"]
-
-        features = []
-        target_len = args.max_seq_length
-
-        for idx in range(len(labels)):
-            bert_block = text_bert[idx]
-            input_ids = bert_block[0].astype(np.int64).tolist()
-            input_mask = bert_block[1].astype(np.int64).tolist()
-            segment_ids = bert_block[2].astype(np.int64).tolist()
-
-            # Pad/truncate text to target length
-            def _fix_length(seq, pad_val=0):
-                if len(seq) >= target_len:
-                    return seq[:target_len]
-                return seq + [pad_val] * (target_len - len(seq))
-
-            input_ids = _fix_length(input_ids)
-            input_mask = _fix_length(input_mask)
-            segment_ids = _fix_length(segment_ids)
-
-            # Resample acoustic / visual sequences to the same length as text
-            a_valid = int(audio_lens[idx])
-            v_valid = int(vision_lens[idx])
-
-            acoustic_seq = audio[idx][: max(a_valid, 1)]
-            visual_seq = vision[idx][: max(v_valid, 1)]
-
-            a_idx = np.linspace(0, max(a_valid - 1, 0), num=target_len).astype(int)
-            v_idx = np.linspace(0, max(v_valid - 1, 0), num=target_len).astype(int)
-
-            acoustic_fixed = np.asarray(acoustic_seq[a_idx], dtype=np.float32)
-            visual_fixed = np.asarray(visual_seq[v_idx], dtype=np.float32)
-
-            features.append(
-                InputFeatures(
-                    input_ids=input_ids,
-                    input_mask=input_mask,
-                    segment_ids=segment_ids,
-                    visual=visual_fixed,
-                    acoustic=acoustic_fixed,
-                    label_id=float(labels[idx]),
-                    text_label=float(text_labels[idx]),
-                    audio_label=float(audio_labels[idx]),
-                    visual_label=float(vision_labels[idx]),
-                )
+        
+        # Tokenize raw text
+        tokenizer = AutoTokenizer.from_pretrained(args.model)
+        
+        input_ids_list = []
+        for text in raw_text:
+            # Ensure text is string
+            if not isinstance(text, str):
+                text = str(text)
+            
+            encoded = tokenizer(
+                text,
+                padding='max_length',
+                truncation=True,
+                max_length=args.max_seq_length,
+                return_tensors='pt'
             )
-    else:
-        tokenizer = get_tokenizer(args.model)
-        features = convert_to_features(data, args.max_seq_length, tokenizer)
-
-    all_input_ids = torch.tensor(np.array([f.input_ids for f in features]), dtype=torch.long)
-    all_visual = torch.tensor(np.array([f.visual for f in features]), dtype=torch.float)
-    all_acoustic = torch.tensor(np.array([f.acoustic for f in features]), dtype=torch.float)
-    all_label_ids = torch.tensor(np.array([f.label_id for f in features]), dtype=torch.float)
-    all_text_label_ids = torch.tensor(np.array([f.text_label for f in features]), dtype=torch.float)
-    all_audio_label_ids = torch.tensor(np.array([f.audio_label for f in features]), dtype=torch.float)
-    all_visual_label_ids = torch.tensor(np.array([f.visual_label for f in features]), dtype=torch.float)
+            input_ids_list.append(encoded['input_ids'][0])
+            
+        all_input_ids = torch.stack(input_ids_list)
+    all_input_ids = torch.tensor(text_bert, dtype=torch.float)
+    all_visual = torch.tensor(vision, dtype=torch.float)
+    all_acoustic = torch.tensor(audio, dtype=torch.float)
+    all_label_ids = torch.tensor(labels, dtype=torch.float)
+    all_text_label_ids = torch.tensor(text_labels, dtype=torch.float)
+    all_audio_label_ids = torch.tensor(audio_labels, dtype=torch.float)
+    all_visual_label_ids = torch.tensor(vision_labels, dtype=torch.float)
 
     dataset = TensorDataset(
         all_input_ids,

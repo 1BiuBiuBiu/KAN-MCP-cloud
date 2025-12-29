@@ -181,12 +181,13 @@ class KANMCP(DebertaV2PreTrainedModel):
             visual_label_ids=None
     ):
         # deberta processing text data
-        if self.dataset != "simsv2":
+        # embedding_output = self.Deberta(input_ids)
+        # x_embedding = embedding_output[0]
+        if self.dataset is not "simsv2":
             embedding_output = self.Deberta(input_ids)
             x_embedding = embedding_output[0]
         else:
-            # simsv2 already stores text features; skip DeBERTa and use them directly
-            x_embedding = input_ids.float()
+            x_embedding = input_ids
         # Each encoder receives its own supervision; default to global labels when per-modality labels are absent.
         text_targets = text_label_ids if text_label_ids is not None else label_ids
         audio_targets = audio_label_ids if audio_label_ids is not None else label_ids
@@ -203,11 +204,7 @@ class KANMCP(DebertaV2PreTrainedModel):
             audio_feature = audio_lat[0]
             visual_feature = visual_lat[0]
         else:
-            if self.dataset == "simsv2":
-                # For simsv2 the text features are already pooled; keep feature dim intact
-                x = x_embedding
-            else:
-                x = torch.mean(x_embedding, dim=1)
+            x = torch.mean(x_embedding, dim=1)
             a = torch.mean(acoustic, dim=1)
             v = torch.mean(visual, dim=1)
 
